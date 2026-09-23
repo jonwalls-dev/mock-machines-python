@@ -1,0 +1,449 @@
+type: mock_machines_scenario
+name: ServiceQueue
+metadata:
+  display_name: Service Queue
+  description: A retail bank branch where customers queue for tellers and move through a service session to a feedback outcome over a single business day.
+  context: |
+    A bank Branch opens for the day, opening Teller windows and accepting Customers
+    who each carry a service_type, priority_class and segment. The Branch runs an
+    Open to Closing to Closed lifecycle; Tellers serve Customers through Ticket and
+    ServiceSession entities, recording sessions, escalations and Feedback. One turn
+    is five minutes starting at the 09:00 branch open, so timestamps export as
+    wall-clock times across the trading day and the queue turns over in minutes.
+  category: BI
+  tags: [Queue, Banking, Service, Operations]
+  domain: Operations
+  author: Jon Walls
+  version: "0.1"
+
+# One simulation turn == five minutes, starting at the 09:00 branch open. A teller
+# queue turns over in minutes within a single business day, so timestamp fields
+# export as realistic wall-clock times rather than bare turn numbers.
+timing:
+  turn_duration: 5m
+  start_time: 2024-01-01T09:00:00Z
+
+taxonomy:
+  region:
+    distribution:
+      Downtown: 0.25
+      Suburban: 0.35
+      Airport: 0.10
+      Mall: 0.15
+      University: 0.15
+
+  branch_size:
+    dependency: region
+    lookups:
+      Downtown: Large
+      Suburban: Medium
+      Airport: Small
+      Mall: Medium
+      University: Small
+
+  service_type:
+    distribution:
+      Account Opening: 0.10
+      Deposit: 0.25
+      Withdrawal: 0.20
+      Transfer: 0.12
+      Loan Inquiry: 0.08
+      Card Services: 0.10
+      Bill Payment: 0.10
+      General Inquiry: 0.05
+
+  priority_class:
+    options:
+      - Standard
+      - Priority
+      - VIP
+
+  customer_segment:
+    distribution:
+      Walk-In: 0.55
+      Appointment: 0.25
+      Returning: 0.15
+      Referred: 0.05
+
+  peak_period:
+    options:
+      - Morning Rush
+      - Midday
+      - Afternoon
+      - Closing Rush
+
+  complexity:
+    dependency: service_type
+    weights:
+      Account Opening: 8
+      Deposit: 2
+      Withdrawal: 2
+      Transfer: 4
+      Loan Inquiry: 9
+      Card Services: 5
+      Bill Payment: 3
+      General Inquiry: 1
+
+  avg_wait_minutes:
+    dependency: region
+    weights:
+      Downtown: 12
+      Suburban: 8
+      Airport: 15
+      Mall: 10
+      University: 6
+
+state_machines:
+  Branch:
+    load_file: 'seed/Branch.csv'
+    init_state: Open
+    fields:
+      taxonomy:
+        - { name: region, func: random }
+        - { name: branch_size, func: random }
+      counters:
+        - { name: customers_served, func: default, init: 0 }
+        - { name: active_tellers, func: default, init: 0 }
+      timestamp:
+        - { name: opened_at,  on: create }
+        - { name: closing_at, on: enter, state: Closing }
+        - { name: closed_at,  on: enter, state: Closed }
+
+    states:
+      Open:
+        description: Branch is open for business.
+        events:
+          - name: Open Teller Window
+            actions:
+              - { type: new_entity, entity: Teller, state: Available, references: { branch: self } }
+              - { type: update, field: active_tellers, operator: add, value: 1 }
+          - name: Branch Closing
+            actions:
+              - { type: transition, state: Closing }
+        probabilities:
+          - [0.0, 1.0, 0.0]
+          - [0.0, 1.0, 0.0]
+          - [0.0, 1.0, 0.0]
+          - [0.85, 0.10, 0.05]
+
+      Closing:
+        description: Branch winding down, no new customers accepted.
+        events:
+          - name: Branch Closed
+            actions:
+              - { type: transition, state: Closed }
+        probabilities:
+          - [0.5, 0.5]
+          - [0.2, 0.8]
+          - [0.0, 1.0]
+
+      Closed:
+        description: Branch closed for the day.
+        events:
+          - name: Branch Reopened
+            actions:
+              - { type: transition, state: Open }
+        probabilities:
+          - [1, 0]
+          - [1, 0]
+          - [1, 0]
+          - [0.0, 1.0]
+
+  Teller:
+    reference: [branch]
+    init_state: Available
+    fields:
+      taxonomy:
+        - { name: region, func: inherit }
+      counters:
+        - { name: sessions_completed, func: default, init: 0 }
+        - { name: escalations, func: default, init: 0 }
+      timestamp:
+        - { name: shift_started_at, on: create }
+        - { name: off_duty_at,      on: enter, state: Off Duty }
+
+    states:
+      Available:
+        description: Teller is free and ready to serve a customer.
+        events:
+          - name: Customer Assigned
+            actions:
+              - { type: transition, state: Serving }
+              - { type: new_entity, entity: ServiceSession, state: In Progress, references: { teller: self } }
+          - name: Teller Break
+            actions:
+              - { type: transition, state: On Break }
+        probabilities: [[0.10, 0.80, 0.10]]
+
+      Serving:
+        description: Teller actively serving a customer.
+        events:
+          - name: Service Completed
+            actions:
+              - { type: transition, state: Available }
+              - { type: update, field: sessions_completed, operator: add, value: 1 }
+              - { type: update_reference, target: branch, field: customers_served, operator: add, value: 1 }
+          - name: Escalation Required
+            actions:
+              - { type: update, field: escalations, operator: add, value: 1 }
+        probabilities:
+          - [0.6, 0.3, 0.1]
+          - [0.3, 0.6, 0.1]
+          - [0.0, 0.9, 0.1]
+
+      On Break:
+        description: Teller on scheduled break.
+        events:
+          - name: Break Ended
+            actions:
+              - { type: transition, state: Available }
+          - name: Shift Ended
+            actions:
+              - { type: transition, state: Off Duty }
+        probabilities:
+          - [0.3, 0.6, 0.1]
+          - [0.0, 0.8, 0.2]
+
+      Off Duty:
+        description: Teller's shift has ended.
+        events: []
+        probabilities: [[1]]
+
+  Customer:
+    load_file: 'seed/Customer.csv'
+    init_state: Arriving
+    fields:
+      taxonomy:
+        - { name: region, func: random }
+        - { name: customer_segment, func: random }
+        - { name: priority_class, func: random }
+        - { name: service_type, func: random }
+        - { name: peak_period, func: random }
+      counters:
+        - { name: visits, func: default, init: 0 }
+        - { name: wait_turns, func: default, init: 0 }
+      timestamp:
+        - { name: arrived_at,         on: create }
+        - { name: waiting_at,         on: enter, state: Waiting }
+        - { name: served_started_at,  on: enter, state: Being Served }
+        - { name: served_at,          on: enter, state: Served }
+        - { name: abandoned_at,       on: enter, state: Abandoned }
+        - { name: balked_at,          on: enter, state: Balked }
+
+    states:
+      Arriving:
+        description: Customer enters the branch.
+        events:
+          - name: Take Ticket
+            actions:
+              - { type: transition, state: Waiting }
+              - { type: new_entity, entity: Ticket, state: Queued, references: { customer: self } }
+              - { type: update, field: visits, operator: add, value: 1 }
+          - name: Customer Left Immediately
+            actions:
+              - { type: transition, state: Balked }
+        probabilities:
+          - [0.0, 0.90, 0.10]
+
+      Waiting:
+        description: Customer in queue waiting to be served.
+        events:
+          - name: Called to Window
+            actions:
+              - { type: transition, state: Being Served }
+          - name: Customer Abandoned
+            actions:
+              - { type: transition, state: Abandoned }
+          - name: Still Waiting
+            actions:
+              - { type: update, field: wait_turns, operator: add, value: 1 }
+        probabilities:
+          - [0.3, 0.5, 0.0, 0.2]
+          - [0.2, 0.6, 0.02, 0.18]
+          - [0.1, 0.7, 0.05, 0.15]
+          - [0.0, 0.7, 0.10, 0.20]
+          - [0.0, 0.6, 0.15, 0.25]
+          - [0.0, 0.5, 0.20, 0.30]
+          - [0.0, 0.3, 0.40, 0.30]
+          - [0.0, 0.1, 0.90, 0.0]
+
+      Being Served:
+        description: Customer at the teller window.
+        events:
+          - name: Service Complete
+            actions:
+              - { type: transition, state: Served }
+              - { type: new_entity, entity: Feedback, state: Pending, references: { customer: self } }
+          - name: Needs Additional Service
+            actions:
+              - { type: update, field: wait_turns, operator: add, value: 1 }
+        probabilities:
+          - [0.3, 0.5, 0.2]
+          - [0.1, 0.8, 0.1]
+          - [0.0, 0.9, 0.1]
+
+      Served:
+        description: Customer has been fully served.
+        events: []
+        probabilities: [[1]]
+
+      Abandoned:
+        description: Customer left the queue before being served.
+        events: []
+        probabilities: [[1]]
+
+      Balked:
+        description: Customer saw the queue and left immediately.
+        events: []
+        probabilities: [[1]]
+
+  Ticket:
+    reference: [customer]
+    init_state: Queued
+    fields:
+      taxonomy:
+        - { name: service_type, func: inherit }
+        - { name: priority_class, func: inherit }
+        - { name: peak_period, func: inherit }
+      counters:
+        - { name: position_changes, func: default, init: 0 }
+      timestamp:
+        - { name: issued_at,    on: create }
+        - { name: called_at,    on: enter, state: Called }
+        - { name: completed_at, on: enter, state: Completed }
+        - { name: expired_at,   on: enter, state: Expired }
+
+    states:
+      Queued:
+        description: Ticket in the queue waiting to be called.
+        events:
+          - name: Ticket Called
+            actions:
+              - { type: transition, state: Called }
+          - name: Ticket Expired
+            actions:
+              - { type: transition, state: Expired }
+          - name: Position Changed
+            actions:
+              - { type: update, field: position_changes, operator: add, value: 1 }
+        probabilities:
+          - [0.3, 0.5, 0.0, 0.2]
+          - [0.2, 0.6, 0.02, 0.18]
+          - [0.1, 0.7, 0.05, 0.15]
+          - [0.0, 0.7, 0.10, 0.20]
+          - [0.0, 0.5, 0.25, 0.25]
+          - [0.0, 0.2, 0.80, 0.0]
+
+      Called:
+        description: Ticket number was called, customer proceeds to window.
+        events:
+          - name: Ticket Completed
+            actions:
+              - { type: transition, state: Completed }
+          - name: No Show
+            actions:
+              - { type: transition, state: Expired }
+        probabilities:
+          - [0.0, 0.9, 0.1]
+
+      Completed:
+        description: Service was performed for this ticket.
+        events: []
+        probabilities: [[1]]
+
+      Expired:
+        description: Ticket expired or customer did not respond.
+        events: []
+        probabilities: [[1]]
+
+  ServiceSession:
+    reference: [teller]
+    init_state: In Progress
+    fields:
+      taxonomy:
+        - { name: region, func: inherit }
+        - { name: service_type, func: random }
+      counters:
+        - { name: interactions, func: default, init: 0 }
+      dimensions:
+        - { name: resolution, func: default, init: pending }
+      timestamp:
+        - { name: opened_at,    on: create }
+        - { name: escalated_at, on: enter, state: Escalated }
+        - { name: resolved_at,  on: enter, state: Resolved }
+
+    states:
+      In Progress:
+        description: Active service session between teller and customer.
+        events:
+          - name: Session Resolved
+            actions:
+              - { type: transition, state: Resolved }
+              - { type: update, field: resolution, operator: set, value: completed }
+          - name: Session Escalated
+            actions:
+              - { type: transition, state: Escalated }
+              - { type: update, field: interactions, operator: add, value: 1 }
+          - name: Interaction Logged
+            actions:
+              - { type: update, field: interactions, operator: add, value: 1 }
+        probabilities:
+          - [0.4, 0.4, 0.05, 0.15]
+          - [0.2, 0.6, 0.05, 0.15]
+          - [0.0, 0.8, 0.10, 0.10]
+
+      Escalated:
+        description: Session escalated to a supervisor or specialist.
+        events:
+          - name: Escalation Resolved
+            actions:
+              - { type: transition, state: Resolved }
+              - { type: update, field: resolution, operator: set, value: escalation_resolved }
+          - name: Further Escalation
+            actions:
+              - { type: update, field: interactions, operator: add, value: 1 }
+        probabilities:
+          - [0.3, 0.5, 0.2]
+          - [0.1, 0.7, 0.2]
+          - [0.0, 0.9, 0.1]
+
+      Resolved:
+        description: Service session completed successfully.
+        events: []
+        probabilities: [[1]]
+
+  Feedback:
+    reference: [customer]
+    init_state: Pending
+    fields:
+      taxonomy:
+        - { name: service_type, func: random }
+        - { name: customer_segment, func: inherit }
+      timestamp:
+        - { name: requested_at, on: create }
+        - { name: submitted_at, on: enter, state: Submitted }
+
+    states:
+      Pending:
+        description: Feedback request sent to customer.
+        events:
+          - name: Feedback Submitted
+            actions:
+              - { type: transition, state: Submitted }
+          - name: Feedback Ignored
+            actions:
+              - { type: transition, state: No Response }
+        probabilities:
+          - [0.5, 0.2, 0.3]
+          - [0.2, 0.2, 0.6]
+          - [0.0, 0.1, 0.9]
+
+      Submitted:
+        description: Customer submitted feedback.
+        events: []
+        probabilities: [[1]]
+
+      No Response:
+        description: Customer did not respond to feedback request.
+        events: []
+        probabilities: [[1]]

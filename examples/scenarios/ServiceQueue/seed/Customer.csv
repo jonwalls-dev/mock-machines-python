@@ -1,0 +1,6 @@
+region,customer_segment,priority_class,service_type,peak_period,visits,wait_turns
+Downtown,Walk-In,Standard,Deposit,Morning Rush,0,0
+Suburban,Appointment,Priority,Loan Inquiry,Midday,0,0
+Airport,Walk-In,Standard,Withdrawal,Afternoon,0,0
+Mall,Returning,VIP,Card Services,Closing Rush,0,0
+University,Walk-In,Standard,Bill Payment,Morning Rush,0,0

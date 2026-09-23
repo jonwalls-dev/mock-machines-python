@@ -1,0 +1,532 @@
+# OnlineShopping Simulation
+# Exercises all CON-266 message handling features: handlers, emit_message,
+# set_reference, new_entity references block, product catalog, field families,
+# bracket expressions, explicit operators, first-match-wins branching.
+#
+# Entities: Customer (root), Warehouse (root), Order, Line Item, Shipment
+# Scenarios covered: all 7 from the CON-266 scenarios document, plus CON-552
+# one-to-many relationships: Customer → many Order (association) and Order → many
+# Line Item (composition, passive), created as an atomic same-turn instant
+# composite; order_count via aggregate count, order_total via aggregate sum.
+
+type: mock_machines_scenario
+name: OnlineShopping
+metadata:
+  display_name: Online Shopping
+  description: An online retail simulation exercising cross-entity messaging, references and aggregates across customers, warehouses, orders, line items and shipments.
+  context: |
+    Models an ecommerce fulfilment flow with five entity types: Customer and
+    Warehouse are roots; an Order is placed by a Customer, composed atomically of
+    many Line Items, and progresses through confirmation, shipment and delivery
+    via a Shipment. Orders sample products from an inline catalog; Warehouses
+    track per-product stock through field families, and the product index travels
+    in message payloads so handlers update the right stock counter via bracket
+    expressions. One turn is one hour, so timestamps export as wall-clock columns.
+    Demonstrates handlers, emit_message, set_reference, one-to-many associations
+    and composition, aggregate count/sum measures, and first-match-wins branching.
+  category: BI
+  tags: [Ecommerce, Fulfilment, Messaging, FSM]
+  domain: Retail
+  author: Jon Walls
+  version: "0.1"
+
+message_cascade_depth: 5
+
+# One simulation turn == one hour. Order placement → confirmation → shipment →
+# delivery round-trips resolve within hours, so timestamp fields export as
+# realistic wall-clock columns rather than bare turn numbers.
+timing:
+  turn_duration: 1h
+  start_time: 2024-01-01T00:00:00Z
+
+taxonomy:
+  region:
+    distribution:
+      north: 0.3
+      south: 0.3
+      east: 0.2
+      west: 0.2
+
+# ==========================================================================
+# Product catalog — static reference data, not entities
+# ==========================================================================
+# Each entry is indexed at load time. Orders sample a product at spawn.
+# Warehouses track per-product stock via field families. The product index
+# travels in message payloads so handlers can operate on the correct stock
+# counter using bracket expressions: stock_available[payload.product].
+
+catalog:
+  products:
+    - { sku: "WIDGET-A",  name: "Blue Widget",    price: 29.99, category: electronics }
+    - { sku: "GADGET-B",  name: "Red Gadget",     price: 49.99, category: electronics }
+    - { sku: "SHIRT-C",   name: "Green Shirt",    price: 19.99, category: clothing }
+    - { sku: "BOOK-D",    name: "Go Handbook",    price: 39.99, category: books }
+    - { sku: "LAMP-E",    name: "Desk Lamp",      price: 59.99, category: home }
+
+
+# ==========================================================================
+# Warehouse — seed entity, always active
+# ==========================================================================
+# Machine-level handlers only (no state-level overrides needed).
+# All request-response flows use sender-reply: the Warehouse never needs
+# a stored reference to any Order or Customer.
+#
+# Stock is tracked per product via field families. Each family declaration
+# expands to one counter per catalog entry (e.g., stock_available becomes
+# stock_available[0] through stock_available[4] for a 5-product catalog).
+# Handlers use bracket expressions to select the counter for the specific
+# product identified in the message payload.
+
+state_machines:
+  Warehouse:
+    init_state: active
+    fields:
+      taxonomy:
+        - { name: region, func: random }
+      counters:
+        - { name: fulfilled_orders, func: default, init: 0 }
+        - { name: orders_processing_today, func: default, init: 0 }
+      families:
+        - { name: stock_available, family: products, init: 20 }
+        - { name: stock_reserved, family: products, init: 0 }
+
+    # ── Machine-level messages_accepted ────────────────────────────────
+    messages_accepted:
+
+      # PlaceOrder: first-match-wins (Scenarios 1, 2, 7)
+      - message: PlaceOrder
+        handlers:
+          - name: place_order_in_stock
+            conditions:
+              - { field: "stock_available[payload.product]", operator: atLeast, value: 1 }
+            actions:
+              - { type: update, field: "stock_available[payload.product]", operator: subtract, value: 1 }
+              - { type: update, field: "stock_reserved[payload.product]", operator: add, value: 1 }
+              - { type: emit_message, target: sender, message: OrderConfirmed }
+          - name: place_order_out_of_stock
+            actions:
+              - { type: emit_message, target: sender, message: OrderRejected }
+
+      # FulfillOrder: first-match-wins (Scenario 1)
+      - message: FulfillOrder
+        handlers:
+          - name: fulfill_order_reserved
+            conditions:
+              - { field: "stock_reserved[payload.product]", operator: atLeast, value: 1 }
+            actions:
+              - { type: update, field: "stock_reserved[payload.product]", operator: subtract, value: 1 }
+              - { type: update, field: fulfilled_orders, operator: add, value: 1 }
+              - type: new_entity
+                entity: Shipment
+                references:
+                  order: sender
+                  warehouse: self
+              - { type: emit_message, target: sender, message: ShipmentDispatched }
+          - name: fulfill_order_delayed
+            actions:
+              - { type: emit_message, target: sender, message: FulfillmentDelayed }
+
+      # CancelOrder (Scenarios 3, 5)
+      - message: CancelOrder
+        handlers:
+          - name: cancel_order
+            actions:
+              - { type: update, field: "stock_reserved[payload.product]", operator: subtract, value: 1 }
+              - { type: update, field: "stock_available[payload.product]", operator: add, value: 1 }
+              - { type: emit_message, target: sender, message: CancelConfirmed }
+
+      # ProcessReturn (Scenario 4)
+      - message: ProcessReturn
+        handlers:
+          - name: process_return
+            actions:
+              - { type: update, field: "stock_available[payload.product]", operator: add, value: 1 }
+              - { type: emit_message, target: sender, message: ReturnApproved }
+
+    # ── States ──────────────────────────────────────────────────────────
+    states:
+      active:
+        events:
+          - name: restock
+            actions:
+              - { type: update, field: stock_available, operator: add, value: 10, apply: all }
+          - name: reset_daily_capacity
+            actions:
+              - { type: update, field: orders_processing_today, operator: set, value: 0 }
+        probabilities:
+          #       [stay,  restock, reset_daily]
+          - [0.7, 0.2, 0.1]
+
+
+  # ========================================================================
+  # Customer — seed entity
+  # ========================================================================
+  # Spawns Orders and provides the region taxonomy they inherit.
+
+  Customer:
+    init_state: shopping
+    # Customer → many Order is an association (one-to-many): Orders self-drive.
+    collections:
+      - { name: orders, entity: Order }
+    fields:
+      taxonomy:
+        - { name: region, func: random }
+      counters:
+        # Filled by aggregate count over the orders collection (replaces the old
+        # faked orders_received counter that an Order used to bump remotely).
+        - { name: order_count, func: default, init: 0 }
+      timestamp:
+        - { name: joined_at, on: create }
+        - { name: closed_at, on: enter, state: closed }
+
+    states:
+      # The lifecycle is two-phase so the final order_count is exact: a Customer
+      # places orders while `shopping`, then transitions to `closed` and only
+      # then counts. Counting in a terminal state (after the last order is placed)
+      # makes order_count == the true number of Orders this Customer owns, rather
+      # than a running snapshot taken between further placements.
+      shopping:
+        events:
+          # Create an Order AND its two Line Items atomically, this turn, as an
+          # instant composite. The Order is bound to `ord`; each Line Item's
+          # `order` back-reference points at `ord`, so it lands in the Order's
+          # line_items collection (and the Order lands in this Customer's orders
+          # collection via its own `customer` back-reference).
+          - name: place_order
+            actions:
+              - { type: new_entity, entity: Order, visibility: instant, bind: ord, references: { customer: self } }
+              - { type: new_entity, entity: Line Item, visibility: instant, references: { order: { bound: ord } } }
+              - { type: new_entity, entity: Line Item, visibility: instant, references: { order: { bound: ord } } }
+          - name: close_account
+            actions:
+              - { type: transition, state: closed }
+        probabilities:
+          #       [stay,  place_order, close_account]
+          - [0.6, 0.4, 0.0]
+          - [0.4, 0.5, 0.1]
+          - [0.3, 0.5, 0.2]
+          - [0.2, 0.5, 0.3]
+          - [0.2, 0.4, 0.4]
+
+      # Terminal: no more orders are placed. tally_orders folds the (now stable)
+      # orders collection into order_count via aggregate count. Re-tallying every
+      # turn is harmless — once every instant-created Order has activated, the
+      # count is the final total, which is what lands in customer.csv.
+      closed:
+        events:
+          - name: tally_orders
+            actions:
+              - { type: aggregate, collection: orders, field: order_count, operator: count }
+        probabilities:
+          #       [stay,  tally_orders]
+          - [0.0, 1.0]
+
+
+  # ========================================================================
+  # Order — spawned by Customer
+  # ========================================================================
+  # Central entity. Drives its own lifecycle: selects a warehouse, requests
+  # fulfillment, receives delivery/loss notification.
+
+  Order:
+    init_state: pending
+    reference:
+      - { name: customer, entity: Customer }
+      - { name: warehouse, entity: Warehouse }
+    # Order → many Line Item is a composition (one-to-many): Line Items are
+    # passive and driven by their Order.
+    collections:
+      - { name: line_items, entity: Line Item }
+    fields:
+      taxonomy:
+        - { name: region, func: inherit }
+      catalog:
+        # `product` (func: random) samples a catalog entry; `order_value`
+        # (func: from_catalog) derives that entry's price. from_catalog derivation
+        # is a catalog-field concern (it reads the sibling random catalog index),
+        # so order_value lives under `catalog:`, not `measures:`.
+        - { name: product, func: random, source: products }
+        - { name: order_value, func: from_catalog, source: products, field: price }
+      measures:
+        # = sum of the line_value of every Line Item in line_items (aggregate sum).
+        - { name: order_total, func: default, init: 0.0 }
+      # Lifecycle milestone timestamps — first entry to each state, exported as
+      # wall-clock dates via timing:. An order that never reaches a state exports
+      # an empty column there.
+      timestamp:
+        - { name: ordered_at,   on: create }
+        - { name: confirmed_at, on: enter, state: confirmed }
+        - { name: shipped_at,   on: enter, state: shipped }
+        - { name: delivered_at, on: enter, state: delivered }
+        - { name: returned_at,  on: enter, state: returned }
+        - { name: cancelled_at, on: enter, state: cancelled }
+        - { name: rejected_at,  on: enter, state: rejected }
+
+    # ── States ──────────────────────────────────────────────────────────
+    states:
+
+      # ── pending ───────────────────────────────────────────────────────
+      pending:
+        events:
+          - name: select_warehouse
+            actions:
+              - type: set_reference
+                reference: warehouse
+                entity: Warehouse
+                match_field: region
+              - type: emit_message
+                target: warehouse
+                message: PlaceOrder
+                payload:
+                  product: self.product
+              # Fold each Line Item's line_value into order_total as part of placing
+              # the order. line_value is fixed at spawn, so folding here (the Order's
+              # first step, one turn after its instant Line Items activated) is exact
+              # and never needs redoing. Runs on the Order, which owns both the
+              # line_items collection and the order_total measure. Bundling the fold
+              # into select_warehouse — rather than a separate probabilistic event —
+              # guarantees every placed order tallies its line items exactly once.
+              - { type: aggregate, collection: line_items, child_field: line_value, field: order_total, operator: sum }
+          - name: cancel
+            actions:
+              - { type: transition, state: cancelled }
+          # (recalculate event removed — the fold now happens unconditionally in
+          # select_warehouse rather than competing with it as a probabilistic event.)
+        messages_accepted:
+          - message: OrderConfirmed
+            handlers:
+              - name: order_confirmed
+                actions:
+                  - { type: transition, state: confirmed }
+          - message: OrderRejected
+            handlers:
+              - name: order_rejected
+                actions:
+                  - { type: transition, state: rejected }
+        probabilities:
+          #       [stay,  select_warehouse, cancel]
+          - [0.0, 0.95, 0.05]
+
+      # ── confirmed ────────────────────────────────────────────────────
+      confirmed:
+        events:
+          - name: request_fulfillment
+            actions:
+              - type: emit_message
+                target: warehouse
+                message: FulfillOrder
+                payload:
+                  product: self.product
+
+          - name: cancel
+            conditions:
+              - { field: Age, operator: atMost, value: 5 }
+            actions:
+              - { type: transition, state: cancelling }
+              - type: emit_message
+                target: warehouse
+                message: CancelOrder
+                payload:
+                  product: self.product
+
+          - name: fulfillment_timeout
+            conditions:
+              - { field: Age, operator: atLeast, value: 10 }
+            actions:
+              - { type: transition, state: timed_out }
+              - type: emit_message
+                target: warehouse
+                message: CancelOrder
+                payload:
+                  product: self.product
+
+        messages_accepted:
+          - message: ShipmentDispatched
+            handlers:
+              - name: shipment_dispatched
+                actions:
+                  - { type: transition, state: shipped }
+          - message: FulfillmentDelayed
+            handlers:
+              - name: fulfillment_delayed
+                actions: []
+
+        probabilities:
+          #       [stay,  fulfillment, cancel, timeout]
+          - [0.7, 0.2, 0.1, 0.0]
+          - [0.4, 0.4, 0.2, 0.0]
+          - [0.1, 0.7, 0.2, 0.0]
+          - [0.0, 0.8, 0.2, 0.0]
+          - [0.0, 0.8, 0.2, 0.0]
+          - [0.0, 0.9, 0.1, 0.0]
+          - [0.0, 1.0, 0.0, 0.0]
+          - [0.0, 1.0, 0.0, 0.0]
+          - [0.0, 1.0, 0.0, 0.0]
+          - [0.0, 1.0, 0.0, 0.0]
+          - [0.0, 0.0, 0.0, 1.0]
+
+      # ── cancelling ────────────────────────────────────────────────────
+      cancelling:
+        messages_accepted:
+          - message: CancelConfirmed
+            handlers:
+              - name: cancel_confirmed
+                actions:
+                  - { type: transition, state: cancelled }
+        events: []
+        probabilities: [[1.0]]
+
+      # ── shipped ───────────────────────────────────────────────────────
+      shipped:
+        messages_accepted:
+          - message: Delivered
+            handlers:
+              - name: delivered
+                actions:
+                  - { type: transition, state: delivered }
+          - message: ShipmentLost
+            handlers:
+              - name: shipment_lost
+                conditions:
+                  - { field: Age, operator: atLeast, value: 1 }
+                actions:
+                  - { type: transition, state: lost_in_transit }
+        events: []
+        probabilities: [[1.0]]
+
+      # ── delivered ─────────────────────────────────────────────────────
+      delivered:
+        events:
+          - name: request_return
+            actions:
+              - { type: transition, state: return_pending }
+              - type: emit_message
+                target: warehouse
+                message: ProcessReturn
+                payload:
+                  product: self.product
+        probabilities:
+          #       [stay,  return]
+          - [0.95, 0.05]
+          - [0.9, 0.1]
+          - [0.85, 0.15]
+
+      # ── return_pending ────────────────────────────────────────────────
+      return_pending:
+        messages_accepted:
+          - message: ReturnApproved
+            handlers:
+              - name: return_approved
+                actions:
+                  - { type: transition, state: returned }
+        events: []
+        probabilities: [[1.0]]
+
+      # ── terminal states ───────────────────────────────────────────────
+      rejected:
+        events: []
+        probabilities: [[1.0]]
+
+      cancelled:
+        events: []
+        probabilities: [[1.0]]
+
+      timed_out:
+        events: []
+        probabilities: [[1.0]]
+
+      lost_in_transit:
+        events: []
+        probabilities: [[1.0]]
+
+      returned:
+        events: []
+        probabilities: [[1.0]]
+
+
+  # ========================================================================
+  # Line Item — composition child of Order (passive)
+  # ========================================================================
+  # Created instant alongside its Order in Customer.place_order. A Line Item is
+  # passive: it is created, ref-wired, activated, exported and message-driven,
+  # but never selected/aged/stepped by the turn loop — its Order drives it.
+  #
+  # Its exported table is line_item.csv (the space in "Line Item" sanitizes to an
+  # underscore) with an order_id FK synthesised from the `order` back-reference.
+  #
+  # line_value is derived at spawn from the sampled product's price
+  # (func: from_catalog needs a func: random catalog field on the same machine to
+  # pick the catalog entry — that is the `product` field below). Order.recalculate
+  # folds these line_value figures into Order.order_total via aggregate sum.
+
+  Line Item:
+    passive: true
+    init_state: active
+    reference:
+      - { name: order, entity: Order }
+    fields:
+      catalog:
+        # `product` (func: random) samples a catalog entry; `line_value`
+        # (func: from_catalog) derives that entry's price at spawn. from_catalog
+        # reads the sibling random catalog index, so it must live under `catalog:`.
+        - { name: product, func: random, source: products }
+        - { name: line_value, func: from_catalog, source: products, field: price }
+      counters:
+        - { name: quantity, func: default, init: 1 }
+
+    states:
+      active:
+        # Passive children still receive messages — a parent Order could broadcast
+        # Recalculate (for_each) and each Line Item would recompute line_value from
+        # the payload. This scenario never broadcasts it, so the handler is omitted
+        # here: under the payload-key registration rule a value_from_payload that no
+        # emit site ever registers is a load error. The for_each + self.<field>
+        # payload + passive-child Recalculate path is exercised by
+        # FixtureForEachAggregate / TestForEach_PayloadResolvesSelfRef instead.
+        events: []
+        probabilities: [[1.0]]
+
+
+  # ========================================================================
+  # Shipment — spawned by Warehouse FulfillOrder handler
+  # ========================================================================
+  # References bound at spawn time via the handler's new_entity references
+  # block: order -> sender (the Order that sent FulfillOrder), warehouse ->
+  # self (the Warehouse handling the request).
+
+  Shipment:
+    init_state: in_transit
+    reference:
+      - { name: order, entity: Order }
+      - { name: warehouse, entity: Warehouse }
+    fields:
+      counters: []
+      timestamp:
+        - { name: dispatched_at, on: create }
+        - { name: delivered_at,  on: enter, state: delivered }
+        - { name: lost_at,       on: enter, state: lost }
+
+    states:
+      in_transit:
+        events:
+          - name: deliver
+            actions:
+              - { type: transition, state: delivered }
+              - { type: emit_message, target: order, message: Delivered }
+          - name: lost
+            actions:
+              - { type: transition, state: lost }
+              - { type: emit_message, target: order, message: ShipmentLost }
+        probabilities:
+          #       [stay,  deliver, lost]
+          - [0.8, 0.15, 0.05]
+          - [0.3, 0.60, 0.10]
+          - [0.1, 0.75, 0.15]
+
+      delivered:
+        events: []
+        probabilities: [[1.0]]
+
+      lost:
+        events: []
+        probabilities: [[1.0]]

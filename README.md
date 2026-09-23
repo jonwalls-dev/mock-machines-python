@@ -14,8 +14,14 @@ see the worked [CliffWalking DQN notebook](https://github.com/jonwalls-dev/mock-
 
 ## Install
 
+Clone this repository for the examples, then install the package into a
+[uv](https://docs.astral.sh/uv/) project:
+
 ```bash
-pip install mock-machines        # or: uv pip install mock-machines
+git clone https://github.com/jonwalls-dev/mock-machines-python.git
+cd mock-machines-python
+uv init --bare          # creates a pyproject.toml for your environment
+uv add mock-machines
 ```
 
 Prebuilt wheels ship the engine shared library and the `mm` CLI binary, so **no
@@ -44,20 +50,35 @@ table = sim.observe("Walker")                 # pyarrow.Table of the walker's st
 print(table)
 ```
 
-Run the complete version with `python examples/quickstart.py`.
+Run the complete version with `uv run python examples/quickstart.py`.
+
+The [CliffWalking DQN notebook](https://github.com/jonwalls-dev/mock-machines-python/tree/main/examples/notebooks)
+trains a neural-network policy against the same scenario. Add its dependencies and
+open it:
+
+```bash
+uv add jupyter torch tensorboard
+uv run jupyter lab examples/notebooks/cliffwalking_dqn.ipynb
+```
 
 ## The `mm` CLI
 
 The wheel also installs `mm`, the engine's command-line runner, for batch runs
-that export their data to disk:
+that export their data to disk. The examples ship two scenarios that run on their
+own, without any Python driving them:
 
 ```bash
-mm -run 50 -out results/ examples/scenarios/CliffWalkingRL/CliffWalkingRL.yaml
-mm -run 200 -format parquet -out results/ my_scenario.yaml
-mm --help
+# A bank branch: customers queue, get served by tellers, and leave feedback -> CSV
+uv run mm -run 100 -format csv -out results/ examples/scenarios/ServiceQueue/ServiceQueue.yaml
+
+# An online store: orders, line items, shipments and returns -> Parquet
+uv run mm -run 100 -format parquet -out results/ examples/scenarios/OnlineShopping/OnlineShopping.yaml
+
+uv run mm --help
 ```
 
-Flags come **before** the scenario path.
+Flags come **before** the scenario path. Each run writes one file per machine,
+plus an `event.log`, to `results/run/experiments/<id>/`.
 
 ## License
 
