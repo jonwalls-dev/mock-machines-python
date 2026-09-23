@@ -1,0 +1,113 @@
+type: mock_machines_scenario
+name: CliffWalkingRL
+metadata:
+  display_name: Cliff Walking RL
+  description: A single-agent Cliff Walking environment driven step-by-step by external action requests for reinforcement learning.
+  context: |
+    A reinforcement-learning variant of Cliff Walking with the same 4x12 grid and
+    blocked sentinel cell, but exactly ONE Walker that never moves on its own. Its
+    Walking state has no policy table and stays put on a plain advance, so the only
+    thing that moves it is an explicit targeted move_* request: one request equals
+    one move equals one turn. There is no CheckCell cascade and no terminal states;
+    the engine is a pure, deterministic transition function, and RL concerns such as
+    reward shaping, the cliff penalty, teleport-to-start, and episode termination are
+    computed externally (Python-side) from the observed cell kind.
+  category: AI
+  tags: [RL, Gridworld, MDP, SingleAgent]
+  domain: Reinforcement Learning
+  author: Jon Walls
+  version: "0.1"
+
+# Single-agent CliffWalking variant tuned for reinforcement learning through the
+# Python embedding (mockmachines). The 4x12 grid + sentinel cell is identical to
+# the CliffWalking scenario (seed/grid.csv): GridCell[0] is the start (bottom
+# left), the bottom row between start and goal is the cliff, GridCell[11] is the
+# goal, and GridCell[48] is a blocked sentinel that edge cells point to so an
+# off-grid move is rejected by an is_not condition rather than leaving the grid.
+#
+# Unlike CliffWalking (many autonomous policy-table walkers), exactly ONE Walker
+# is seeded and it is driven entirely by targeted action requests from Python:
+# one request = one move = one turn. The Walking state has NO policy table and
+# stays put on a plain advance (probabilities [[1, 0, 0, 0, 0]]), so the only
+# thing that ever moves the Walker is an explicit move_* request. There is no
+# CheckCell cascade and no terminal states — the engine is a pure, deterministic
+# transition function, and the RL concerns (reward shaping, cliff penalty +
+# teleport-to-start, episode termination at the goal) are computed Python-side
+# from the observed cell kind. This keeps each env.step() to a single engine turn
+# and makes the dynamics fully reproducible.
+
+taxonomy:
+  kind:
+    options:
+      - normal
+      - cliff
+      - goal
+      - blocked
+
+state_machines:
+  GridCell:
+    load_file: 'seed/grid.csv'
+    init_state: Static
+    reference:
+      - { name: north, entity: GridCell }
+      - { name: south, entity: GridCell }
+      - { name: east, entity: GridCell }
+      - { name: west, entity: GridCell }
+    fields:
+      taxonomy:
+        - { name: kind, func: random }
+      counters:
+        - { name: reward, init: -1 }
+    states:
+      Static:
+        events: []
+        probabilities: [[1]]
+
+  Walker:
+    load_file: 'seed/walker.csv'
+    init_state: Walking
+    reference:
+      - { name: current_cell, entity: GridCell }
+    fields:
+      counters:
+        - { name: steps, init: 0 }
+    states:
+      Walking:
+        # Column order: [stay, move_north, move_south, move_east, move_west].
+        # All mass on "stay" so a plain advance never moves the Walker; movement
+        # comes only from a targeted request, which overrides this row.
+        events:
+          - name: move_north
+            conditions:
+              - { field: "self.current_cell.north.kind", operator: is_not, value: blocked }
+            actions:
+              - type: set_reference
+                reference: current_cell
+                value: "self.current_cell.north"
+              - { type: update, field: steps, operator: add, value: 1 }
+          - name: move_south
+            conditions:
+              - { field: "self.current_cell.south.kind", operator: is_not, value: blocked }
+            actions:
+              - type: set_reference
+                reference: current_cell
+                value: "self.current_cell.south"
+              - { type: update, field: steps, operator: add, value: 1 }
+          - name: move_east
+            conditions:
+              - { field: "self.current_cell.east.kind", operator: is_not, value: blocked }
+            actions:
+              - type: set_reference
+                reference: current_cell
+                value: "self.current_cell.east"
+              - { type: update, field: steps, operator: add, value: 1 }
+          - name: move_west
+            conditions:
+              - { field: "self.current_cell.west.kind", operator: is_not, value: blocked }
+            actions:
+              - type: set_reference
+                reference: current_cell
+                value: "self.current_cell.west"
+              - { type: update, field: steps, operator: add, value: 1 }
+        probabilities:
+          - [1, 0, 0, 0, 0]
