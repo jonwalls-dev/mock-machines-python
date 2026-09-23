@@ -1,0 +1,119 @@
+# KnapsackShopping — a deliberately small cut of OnlineShopping that generates
+# 0/1 knapsack problem instances.
+#
+# One Warehouse is seeded per region (seed/Warehouse.csv), each with a delivery
+# van of fixed capacity. Every Customer places exactly one single-product Order,
+# which is routed to the Warehouse in the Customer's region. Because regions are
+# weighted, the warehouses receive different numbers of orders from the same
+# run: each Warehouse's order book is one knapsack instance — items are orders
+# (value = product price, weight = product weight), capacity is the van.
+# The Customer count (the seed count) controls the volume of orders; the region
+# weights control how that volume is spread, i.e. the order density per warehouse.
+
+type: mock_machines_scenario
+name: KnapsackShopping
+metadata:
+  display_name: Knapsack Shopping
+  description: A simplified online store that routes one-product orders to regional warehouses, generating knapsack instances of varying size for optimization benchmarks.
+  context: |
+    Customers are seeded with a weighted region and each places one Order for a
+    single catalog product. The Order inherits the Customer's region, looks up the
+    Warehouse in that region and notifies it. Each Warehouse ends the run with a
+    book of orders (price and weight per order) and a van capacity from its seed
+    row: a 0/1 knapsack problem whose size follows the region's weight.
+  category: Optimization
+  tags: [Ecommerce, Knapsack, Optimization, Quantum]
+  domain: Retail
+  author: Jon Walls
+  version: "0.1"
+
+taxonomy:
+  region:
+    distribution:
+      north: 0.4
+      south: 0.3
+      east: 0.2
+      west: 0.1
+
+# Weights are small integers so the knapsack encodes in few qubits: the Qiskit
+# formulation needs one qubit per item plus log2(capacity) slack qubits.
+catalog:
+  products:
+    - { sku: "WIDGET-A", name: "Blue Widget",  price: 29.99, weight_kg: 2, category: electronics }
+    - { sku: "GADGET-B", name: "Red Gadget",   price: 49.99, weight_kg: 3, category: electronics }
+    - { sku: "SHIRT-C",  name: "Green Shirt",  price: 19.99, weight_kg: 1, category: clothing }
+    - { sku: "BOOK-D",   name: "Go Handbook",  price: 39.99, weight_kg: 2, category: books }
+    - { sku: "LAMP-E",   name: "Desk Lamp",    price: 59.99, weight_kg: 5, category: home }
+    - { sku: "KETTLE-F", name: "Steel Kettle", price: 34.99, weight_kg: 4, category: home }
+    - { sku: "CHAIR-G",  name: "Desk Chair",   price: 89.99, weight_kg: 7, category: home }
+
+state_machines:
+
+  # One per region, from seed/Warehouse.csv. Passive recipient of PlaceOrder.
+  Warehouse:
+    load_file: 'seed/Warehouse.csv'
+    init_state: open
+    fields:
+      taxonomy:
+        - { name: region, func: random }
+      counters:
+        - { name: van_capacity_kg, func: default, init: 15 }
+        - { name: orders_received, func: default, init: 0 }
+    messages_accepted:
+      - message: PlaceOrder
+        handlers:
+          - name: receive_order
+            actions:
+              - { type: update, field: orders_received, operator: add, value: 1 }
+    states:
+      open:
+        events: []
+        probabilities: [[1.0]]
+
+  # Seeded seedCount times; places exactly one Order and is done.
+  Customer:
+    init_state: shopping
+    fields:
+      taxonomy:
+        - { name: region, func: random }
+    states:
+      shopping:
+        events:
+          - name: place_order
+            actions:
+              - { type: new_entity, entity: Order, references: { customer: self } }
+              - { type: transition, state: done }
+        probabilities:
+          #  [stay, place_order]
+          - [0.0, 1.0]
+      done:
+        events: []
+        probabilities: [[1.0]]
+
+  # One product, no line items. Routed to its region's Warehouse.
+  Order:
+    init_state: pending
+    reference:
+      - { name: customer, entity: Customer }
+      - { name: warehouse, entity: Warehouse }
+    fields:
+      taxonomy:
+        - { name: region, func: inherit }
+      catalog:
+        - { name: product, func: random, source: products }
+        - { name: value, func: from_catalog, source: products, field: price }
+        - { name: weight_kg, func: from_catalog, source: products, field: weight_kg }
+    states:
+      pending:
+        events:
+          - name: route_to_warehouse
+            actions:
+              - { type: set_reference, reference: warehouse, entity: Warehouse, match_field: region }
+              - { type: emit_message, target: warehouse, message: PlaceOrder }
+              - { type: transition, state: queued }
+        probabilities:
+          #  [stay, route_to_warehouse]
+          - [0.0, 1.0]
+      queued:
+        events: []
+        probabilities: [[1.0]]

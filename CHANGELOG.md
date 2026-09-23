@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- `Simulation.observe(...).to_pandas()` no longer fails with "Categorical
+  categories must be unique" on machines with catalog fields: catalog columns now
+  list every catalog entry, not only the ones the entities happen to use.
+- New `KnapsackShopping` example scenario and a notebook
+  (`examples/notebooks/knapsack_qiskit.ipynb`) that turns its warehouse order
+  books into knapsack problems and solves them with Qiskit's QAOA, comparing it
+  against an exact solver and OR-Tools.
+
 ## 0.2.1
 
 First release on PyPI.
